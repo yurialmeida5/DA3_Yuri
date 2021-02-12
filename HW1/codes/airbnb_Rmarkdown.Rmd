@@ -1,0 +1,515 @@
+---
+title: "Buenos Aires Airbnb Price Prediction"
+author: "Yuri Almeida Cunha"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+## INTRODUCTION
+
+The idea of the following report is to provide statistical models capable of predicting the short rental prices in the Buenos Aires City of small and mid-apartments size. With all that information it will be possible to a company determinate the costs and possible profits  of his operations inside the Argentinian capital.
+
+## THE DATASET
+
+The dataset is compounded by the Airbnb data collected of the capital on 24/12/202 and contains only the information of small and mid-apartments that can actually accommodate between 2-6 people maximum. It's important to consider that the chosen date is a Christian Holiday and this may affect the standard model prediction, although the results can still be interpreted. Some extreme values and errors under the collection process weren't considered (Property Types chosen were only "Entire Apartments" and "Entire Serviced Apartments" - avoid misclassification and unrelated data). 
+
+```{r setup, include=FALSE}
+#### SET UP
+# It is advised to start a new session for every case study
+# CLEAR MEMORY
+rm(list=ls())
+# Descriptive statistics and regressions
+library(tidyverse)
+library(caret)
+library(skimr)
+library(grid)
+library(glmnet)
+library(stargazer)
+library(xtable)
+library(directlabels)
+library(knitr)
+library(cowplot)
+library(caret)
+library(rpart.plot)
+library(pander)
+```
+
+```{r, include=FALSE, "preparation code", echo=FALSE}
+#Import set up functions
+source("D:/CEU/Data_Analysis_3/da_case_studies/ch00-tech-prep/theme_bg.R")
+source("D:/CEU/Data_Analysis_3/DA3_Yuri/HW1/codes/da_helper_functions.R")
+#-------------------------------------------------------
+# Import data
+data <- read_csv("D:/CEU/Data_Analysis_3/DA3_Yuri/HW1/data/clean/buenos_aires_clean.csv")
+data <- data %>% 
+  filter(!f_neighbourhood_cleansed == "Villa Lugano",
+         !f_neighbourhood_cleansed == "Mataderos",
+         !f_neighbourhood_cleansed == "Villa Soldati",
+         !f_neighbourhood_cleansed == "Parque Avellaneda",
+         !f_neighbourhood_cleansed == "Velez Sarsfield")
+# First look at data
+glimpse(data)
+skim(data)
+# Some statistics
+data %>%
+  group_by(n_accommodates) %>%
+  dplyr::summarize(mean_price = mean(ars_price_day, na.rm=TRUE))
+Hmisc::describe(data$ars_price_day)
+# Check to see if there are any duplicates
+duplicated(names(data))
+# where do we have missing variables now?
+to_filter <- sapply(data, function(x) sum(is.na(x)))
+to_filter[to_filter > 0]
+# what to do with missing values?
+# 1. drop if no target # Done in prepare file 
+data <- data %>%
+  drop_na(ars_price_day)
+# 2. imput when few, not that important
+data <- data %>%
+  mutate(
+    n_bathrooms =  ifelse(is.na(n_bathrooms), median(n_bathrooms, na.rm = T), n_bathrooms), #assume at least 1 bath
+    n_beds = ifelse(is.na(n_beds), n_accommodates, n_beds), #assume n_beds=n_accomodates
+    f_bathroom=ifelse(is.na(f_bathroom),1, f_bathroom),
+    f_minimum_nights=ifelse(is.na(f_minimum_nights),1, f_minimum_nights),
+    f_number_of_reviews=ifelse(is.na(f_number_of_reviews),1, f_number_of_reviews),
+    ln_beds=ifelse(is.na(ln_beds),0, ln_beds),
+  )
+# 3. drop columns when many missing: p_host_response_rate
+data <- data %>%
+  select(-p_host_response_rate)
+to_filter <- sapply(data, function(x) sum(is.na(x)))
+to_filter[to_filter > 0]
+# 4. Replace missing variables reviews with zero, when no review + add flags
+data <- data %>%
+  mutate(
+    flag_days_since = ifelse(is.na(n_days_since),1, 0),
+    n_days_since =  ifelse(is.na(n_days_since), median(n_days_since, na.rm = T), n_days_since),
+    flag_review_scores_rating=ifelse(is.na(n_review_scores_rating),1, 0),
+    n_review_scores_rating =  ifelse(is.na(n_review_scores_rating), median(n_review_scores_rating, na.rm = T), n_review_scores_rating),
+    flag_reviews_per_month=ifelse(is.na(n_reviews_per_month),1, 0),
+    n_reviews_per_month =  ifelse(is.na(n_reviews_per_month), median(n_reviews_per_month, na.rm = T), n_reviews_per_month)
+  )
+table(data$flag_days_since)
+# Look at data
+summary(data$ars_price_day)
+# where do we have missing variables now?
+to_filter <- sapply(data, function(x) sum(is.na(x)))
+to_filter[to_filter > 0]
+```
+
+## THE PRICE DISTRIBUITON
+
+```{r, echo=FALSE, message=FALSE, error=FALSE, "Distribution graph"}
+R_F14_h_price <- ggplot(data, aes(ars_price_day)) +
+  geom_histogram(binwidth = 500, fill = color[1], color = color.outline, alpha = 0.8) +
+  ylab("count") +
+  xlab("Price") +
+  theme_bg()
+R_F14_h_price
+```
+
+Having price as the target value, it`s important to visualize it's distribution. In the case of the following dataset it was possible to check a highly right skewed distribution with a huge quantity of outliers (possibly related to the Christmas Holiday). Following this idea, a limitation of 7000 pesos was applied to the dataset. With that, the distribuiton looked much more closer to a normal one as you can visualize under the graph above. 
+## ANALYZING THE MODEL vARIABLES
+One of the toughest parts of the analysis was related to the fact that the author of this report had no previous knowledge in anything related to hotelary. Combined to that, the dataset used came without a detailed explanation of the entire set of variables. Those 2 factors are important when are trying to interpret coefficients and relations between those variables and the target price. 
+Although the final goal of the following report is based on prediction, some analysis could be done in terms of that relations mentioned above. The graph bellow shows the price details based on the number of people that the flat can actually accommodate (mandatory requirement that defines what it's a small and mid-apartment - 2 to 6 people):
+
+```{r, echo=FALSE, message=FALSE, error=FALSE}
+R_14_s_n_accommodates <- ggplot(data = data, aes(x=n_accommodates, y= ars_price_day)) +
+  geom_point(size=1, colour=color[3], shape=16)+
+  labs(x="Number of people accomodated",y="Price")+
+  geom_smooth(method="lm", colour=color[1], se=FALSE)+
+  theme_bg()
+R_14_s_n_accommodates
+```
+
+As expected, the prices are likely to increase according the number of people that the flats can fit. As well, it's also possible to visualize that the biggest amount of available flats are concentrated on the ones that accommodates the lowest - 2 to people. 
+
+In addition, while investigating the models and filtering the dataset, some other interesting insights can also be mentioned:
+
+```{r, echo=FALSE, message=FALSE, error=FALSE}
+g5 <- ggplot(data, aes(x = factor(n_accommodates), y = ars_price_day,
+                       fill = factor(d_instant_bookable))) +
+  geom_boxplot(alpha=0.8, na.rm=T, outlier.shape = NA, width = 0.8) +
+  stat_boxplot(geom = "errorbar", width = 0.8, size = 0.3, na.rm=T)+
+  labs(x = "Accomodates (Persons)",y = "Price (ARS)" , fill = "Instant_Bookable")+
+  theme_bg() +
+  theme(legend.position = "bottom")
+g5
+```
+
+One of the non-traditional variables on the dataset was related to the possibility of renting the flat instantly. The non-traditional fact about the following is that using the regular the common sense, some people may believe that the prices of flats that you can rent instantly would be higher than the ones you can't. However, checking the graph above, it's possible to conclude that the prices are most likely the same or even higher for non-instantly booking flats. 
+
+Another interesting analysis that can be actually done is related to variable swimming_pool access. As expected the prices of the flat tend to increase while it has access to any sort of swimming pool. However, at least for this author surprise, it's one of the biggest price compounds for the following dataset. While running the CART models (please verify the code file for more details) it was possible to visualize that it came even before the number of bed and bathrooms of the flat.   
+
+## PREDICTIONS
+
+```{r, echo=FALSE, include=FALSE}
+# Basic Variables
+basic_lev  <- c("n_accommodates", "n_beds", "f_bathroom")
+# Additional variables
+basic_add <- c("f_property_type", "n_minimum_nights", "ln_days_since", "d_location", "d_security" , "d_free_parking" ,
+               "d_paid_parking", "d_pets", "d_garden_balcony_backyard", "d_swimming_pool" , "d_cooking" , "d_instant_bookable" )
+reviews <- c("f_number_of_reviews","n_review_scores_rating", "flag_review_scores_rating")
+# Higher orders
+poly_lev <- c("n_accommodates2", "ln_days_since2")
+#################################################
+# Look for interactions
+################################################
+#Look up room type interactions
+p1 <- price_diff_by_variables2(data, "f_property_type", "d_garden_balcony_backyard", "Property Type", "Garden or backyard")
+p2 <- price_diff_by_variables2(data, "f_property_type", "d_swimming_pool", "Property Type", "Swimming Pool")
+#Look up property type
+p3 <- price_diff_by_variables2(data, "f_property_type", "d_pets", "Property Type", "Pets allowed")
+p4 <- price_diff_by_variables2(data, "f_property_type", "d_laundry" , "Property Type", "Laundry")
+#Look up parking
+p5 <- price_diff_by_variables2(data, "f_property_type", "d_free_parking", "Property Type", "Free Parking")
+p6 <- price_diff_by_variables2(data, "f_property_type", "d_paid_parking" , "Property Type", "Paid Parking")
+g_interactions <- plot_grid(p1, p2, p3, p4, p5, p6, nrow=3, ncol=2)
+g_interactions
+# dummies suggested by graphs
+X1  <- c("f_property_type*d_garden_balcony_backyard", "f_property_type*d_swimming_pool" , "f_property_type*d_laundry" )
+# Additional dummies
+X2  <- c("d_baby_utilities", "d_ac" , "d_amendities" , "d_children" , "d_bath", "d_wifi" ,
+         "d_sauna", "d_office", "d_fridge" , "d_cloth_storage" , "d_sound_system", "f_neighbourhood_cleansed")
+X3  <- c("d_barbecue", "d_coffee_maker", "d_bike", "d_eletric_car_charger", "d_luggage_storage", 
+         "d_self_checkin", "d_mandatory_cleaning" , "d_smoking" , "d_videogame")
+# Create models in levels models: 1-7
+modellev1 <- " ~ n_accommodates"
+modellev2 <- paste0(" ~ ",paste(basic_lev,collapse = " + "))
+modellev3 <- paste0(" ~ ",paste(c(basic_lev, basic_add,reviews),collapse = " + "))
+modellev4 <- paste0(" ~ ",paste(c(basic_lev,basic_add,reviews,poly_lev),collapse = " + "))
+modellev5 <- paste0(" ~ ",paste(c(basic_lev,basic_add,reviews,poly_lev,X1),collapse = " + "))
+modellev6 <- paste0(" ~ ",paste(c(basic_lev,basic_add,reviews,poly_lev,X1,X2),collapse = " + "))
+modellev7 <- paste0(" ~ ",paste(c(basic_lev,basic_add,reviews,poly_lev,X1,X2,X3),collapse = " + "))
+#################################
+# Separate hold-out set #
+#################################
+# create a holdout set (20% of observations)
+smp_size <- floor(0.2 * nrow(data))
+# Set the random number generator: It will make results reproducable
+set.seed(20180123)
+# create ids:
+# 1) seq_len: generate regular sequences
+# 2) sample: select random rows from a table
+holdout_ids <- sample(seq_len(nrow(data)), size = smp_size)
+data$holdout <- 0
+data$holdout[holdout_ids] <- 1
+#Hold-out set Set
+data_holdout <- data %>% filter(holdout == 1)
+#Working data set
+data_work <- data %>% filter(holdout == 0)
+##############################
+#      cross validation      #
+##############################
+## N = 5
+n_folds=5
+# Create the folds
+set.seed(20180124)
+folds_i <- sample(rep(1:n_folds, length.out = nrow(data_work) ))
+# Create results
+model_results_cv <- list()
+for (i in (1:7)){
+  model_name <-  paste0("modellev",i)
+  model_pretty_name <- paste0("(",i,")")
+  
+  yvar <- "ars_price_day" 
+  xvars <- eval(parse(text = model_name))
+  formula <- formula(paste0(yvar,xvars))
+  
+  # Initialize values
+  rmse_train <- c()
+  rmse_test <- c()
+  
+  model_work_data <- lm(formula,data = data_work)
+  BIC <- BIC(model_work_data)
+  nvars <- model_work_data$rank -1
+  r2 <- summary(model_work_data)$r.squared
+  
+  # Do the k-fold estimation
+  for (k in 1:n_folds) {
+    test_i <- which(folds_i == k)
+    # Train sample: all except test_i
+    data_train <- data_work[-test_i, ]
+    # Test sample
+    data_test <- data_work[test_i, ]
+    # Estimation and prediction
+    model <- lm(formula,data = data_train)
+    prediction_train <- predict(model, newdata = data_train)
+    prediction_test <- predict(model, newdata = data_test)
+    
+    # Criteria evaluation
+    rmse_train[k] <- mse_lev(prediction_train, data_train$ars_price_day)**(1/2)
+    rmse_test[k] <- mse_lev(prediction_test, data_train$ars_price_day)**(1/2)
+    
+  }
+  
+  model_results_cv[[model_name]] <- list(yvar=yvar,xvars=xvars,formula=formula,model_work_data=model_work_data,
+                                         rmse_train = rmse_train,rmse_test = rmse_test,BIC = BIC,
+                                         model_name = model_pretty_name, nvars = nvars, r2 = r2)
+}
+model <- lm(formula,data = data_train)
+prediction_train <- predict(model, newdata = data_train)
+prediction_test <- predict(model, newdata = data_test)
+t1 <- imap(model_results_cv,  ~{
+  as.data.frame(.x[c("rmse_test", "rmse_train")]) %>%
+    dplyr::summarise_all(.funs = mean) %>%
+    mutate("model_name" = .y , "model_pretty_name" = .x[["model_name"]] ,
+           "nvars" = .x[["nvars"]], "r2" = .x[["r2"]], "BIC" = .x[["BIC"]])
+}) %>%
+  bind_rows()
+t1
+# RMSE training vs test graph
+t1_levels <- t1 %>%
+  dplyr::select("nvars", "rmse_train", "rmse_test") %>%
+  gather(var,value, rmse_train:rmse_test) %>%
+  mutate(nvars2=nvars+1) %>%
+  mutate(var = factor(var, levels = c("rmse_train", "rmse_test"),
+                      labels = c("RMSE Training","RMSE Test")))
+model_result_plot_levels <- ggplot(data = t1_levels,
+                                   aes(x = factor(nvars2), y = value, color=factor(var), group = var)) +
+  geom_line(size=1,show.legend=FALSE, na.rm = TRUE) +
+  scale_color_manual(name="",
+                     values=c(color[2],color[1])) +
+  scale_x_discrete( name = "Number of coefficients", expand=c(0.01, 0.01)) +
+  geom_dl(aes(label = var),  method = list("last.points", dl.trans(x=x-1), cex=0.4)) +
+  #scale_colour_discrete(guide = 'none') +
+  theme_bg()
+model_result_plot_levels
+```
+
+### CROSS VALIDATION
+
+Although the main focus of the analysis is based on simply predictions (not necessarily a need to analyze the coefficents and its relations), the first method applied was the Cross Validation one. In the cross validation the models can choose based on their RMSE and BIC values. The results can be seen under the table bellow: 
+
+```{r, echo=FALSE}
+pander(t1)
+```
+
+Taking a look under the results it's possible to determine, based on RMSE, that the best model is number 1 with the lowest Root Mean Square Error (RMSE). On the other hand, using BIC as measurement the best model would be number 6. The difference between the two in terms of RMSE and BIC are significant, considering that the best option should be picked based on the holdoutset prediction. 
+
+
+```{r, echo=FALSE, error=FALSE , comment=FALSE , warning=FALSE}
+model6_level <- model_results_cv[["modellev6"]][["model_work_data"]]
+model1_level <- model_results_cv[["modellev1"]][["model_work_data"]]
+# look at holdout RMSE
+model6_level_work_rmse <- mse_lev(predict(model6_level, newdata = data_work), data_work$ars_price_day)**(1/2)
+model6_level_holdout_rmse <- mse_lev(predict(model6_level, newdata = data_holdout), data_holdout$ars_price_day)**(1/2)
+# look at holdout RMSE
+model1_level_work_rmse <- mse_lev(predict(model1_level, newdata = data_work), data_work$ars_price_day)**(1/2)
+model1_level_holdout_rmse <- mse_lev(predict(model1_level, newdata = data_holdout), data_holdout$ars_price_day)**(1/2)
+tab_rmse <- data.frame(
+  "Model" = c("Model 1", "Model 6"),
+  "Describe" = c("1 Variable", "73 variables"),
+  "RMSE" = c(model1_level_holdout_rmse, model6_level_holdout_rmse)
+)
+pander(tab_rmse)
+```
+
+Using the results of the holdoutset prediction above and considering that it was possible to have chosen different models based on different measures, BIC and RMSE. The final conclusion it's that the best solution would be the model 6, not only because it was the one that have shown the best measure in terms of R-square, but also regarding the fact that generated the lowest RMSE errors in the prediction.
+
+### LASSO
+
+```{r, echo=FALSE, include=FALSE}
+#################################
+#           LASSO               #
+#################################
+# take model 7 (and find observations where there is no missing data)
+vars_model_6 <- c("ars_price_day", basic_lev,basic_add,reviews,poly_lev,X1,X2)
+vars_model_7 <- c("ars_price_day", basic_lev,basic_add,reviews,poly_lev,X1,X2,X3)
+# Set lasso tuning parameters
+train_control <- trainControl(method = "cv", number = n_folds)
+tune_grid <- expand.grid("alpha" = c(1), "lambda" = seq(0.05, 1, by = 0.05))
+# We use model 7 without the interactions so that it is easy to compare later to post lasso ols
+formula <- formula(paste0("ars_price_day ~ ", paste(setdiff(vars_model_6, "ars_price_day"), collapse = " + ")))
+set.seed(1234)
+lasso_model <- caret::train(formula,
+                            data = data_work,
+                            method = "glmnet",
+                            preProcess = c("center", "scale"),
+                            trControl = train_control,
+                            tuneGrid = tune_grid,
+                            na.action=na.exclude)
+print(lasso_model$bestTune$lambda)
+lasso_coeffs <- coef(lasso_model$finalModel, lasso_model$bestTune$lambda) %>%
+  as.matrix() %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "variable") %>%
+  rename(coefficient = `1`)
+print(lasso_coeffs)
+lasso_coeffs_nz <-lasso_coeffs %>%
+  filter(coefficient!=0)
+print(nrow(lasso_coeffs_nz))
+# Evaluate model. CV error:
+lasso_cv_rmse <- lasso_model$results %>%
+  filter(lambda == lasso_model$bestTune$lambda) %>%
+  dplyr::select(RMSE)
+print(lasso_cv_rmse[1, 1])
+```
+
+```{r, echo=FALSE}
+pander(lasso_model$results)
+```
+
+The LASSO model created for the following dataset returned 71 significant variables and showed a lower RMSE than the Cross Validation Method with a optimal lambda equals to 1 (the results can be seen on the table above). This reduction on RMSE found on the comparison between the best model on Cross Validation with more variables (model 6) and the optimal Lasso lambda can be explained due to the reduction of the amount of non-significant variables including some penalty in case of their inclusion.  
+
+### CART
+
+```{r, echo=FALSE, include=FALSE}
+###################################################
+#                       CART                      #
+###################################################
+# CART model with two slipts
+# Formula
+model1 <- formula(ars_price_day ~ n_accommodates)
+cart1 <- train(
+  model1, data = data_train, method = "rpart2",
+  trControl = trainControl(method="none"),
+  tuneGrid= data.frame(maxdepth=5))
+summary(cart1)
+pred_cart1 <- predict(cart1, data_test)
+rmse_cart1 <- sqrt(mean((pred_cart1 - data_test$ars_price_day)^2))
+
+# CART with an rport default
+cart2 <- train(
+  model1, data = data_train, method = "rpart",
+  trControl = trainControl(method="none"),
+  tuneGrid= expand.grid(cp = 0.01))
+summary(cart2)
+pred_cart2 <- predict(cart2, data_test)
+rmse_cart2 <- sqrt(mean((pred_cart2 - data_test$ars_price_day)^2))
+
+# Since there are only a few factors in this variable there is not many splits that can happen.
+# CART with multiple factors
+# Design models
+yvar <- "ars_price_day" 
+model5 <- formula(formula(paste0(yvar,modellev5)))
+model6 <- formula(formula(paste0(yvar,modellev6)))
+model7 <- formula(formula(paste0(yvar,modellev7)))
+# Tree model based on model 5
+cart3 <- train(
+  model6, data=data_train, method = "rpart2",
+  trControl = trainControl(method="none"),
+  tuneGrid= data.frame(maxdepth=4),
+  na.action = na.pass)
+summary(cart3)
+pred_cart3 <- predict(cart3, data_test, na.action = na.pass)
+rmse_cart3 <- sqrt(mean((pred_cart3 - data_test$ars_price_day)^2))
+# Tree graph
+rpart.plot(cart3$finalModel, tweak=1.2, digits=-1, extra=1)
+# Tree model based on model 7
+cart4 <- train(
+  model7, data=data_train, method = "rpart2",
+  trControl = trainControl(method="none"),
+  tuneGrid= data.frame(maxdepth=10),
+  na.action = na.pass)
+summary(cart4)
+pred_cart4 <- predict(cart4, data_test, na.action = na.pass)
+rmse_cart4 <- sqrt(mean((pred_cart4 - data_test$ars_price_day)^2))
+
+```
+
+```{r , echo=FALSE}
+
+tab_rmse <- data.frame(
+  "Model" = c("CART 1", "CART 2", "CART 3", "CART 4"),
+  "Describe" = c("1 Variable - MaxDepth", "1 Variable - cp", "73 Variables" , "81 Variables"),
+  "RMSE" = c(rmse_cart1,rmse_cart2,rmse_cart3,rmse_cart4)
+)
+pander(tab_rmse)
+```
+
+After running the CART models, it's possible to visualize their results on the table above. Although the CART models tend to be really simplistic models, none of them outstanded the result obtained on the LASSO. All of the RMSE errors presented themselves really high and not fitting properly to be used as the best models for prediction.
+
+### RANDOM FOREST
+
+```{r, echo=FALSE, include=FALSE }
+
+###################################################
+#                   Random Forest                 #
+###################################################
+
+# do 5-fold CV
+train_control <- trainControl(method = "cv",
+                              number = 5,
+                              verboseIter = FALSE)
+
+tune_grid <- expand.grid(
+  .mtry = c(5, 7, 9), # number of features to use for the splits
+  .splitrule = "variance", # based on what to make the split (minimize variance)
+  .min.node.size = c(5, 10) # controlling the complexity of individual trees, minimum node size in this case
+)
+
+# simpler model for model A (1)
+set.seed(1234)
+system.time({
+  rf_model_1 <- train(
+    model6,
+    data = data_train,
+    method = "ranger",
+    trControl = train_control,
+    tuneGrid = tune_grid,
+    importance = "impurity", 
+    na.action = na.omit
+  )
+})
+
+
+```
+
+```{r , echo=FALSE}
+
+pander(rf_model_1$results)
+
+```
+
+
+Considering the results detailed under the table above, the Random Forest Method showed itself a much more robust prediction model than the actual CARTs. Although, the RMSE achieved from those outcomes are really lower in comparison with the ones presented on the CART methods, they didn't differ much from the LASSO method. The Random Forest Algorithm is really easy to apply and code, however it presents its limitations when its related to the analysis of the correlation and casualty between variables.
+
+### GDM
+
+```{r, echo=FALSE, include=FALSE }
+
+###################################################
+#                     GBM                         #
+###################################################
+
+
+gbm_grid <-  expand.grid(interaction.depth = c(1, 5, 10), # complexity of the tree
+                         n.trees = (4:10)*50, # number of iterations, i.e. trees
+                         shrinkage = 0.1, # learning rate: how quickly the algorithm adapts
+                         n.minobsinnode = 20 # the minimum number of training set samples in a node to commence splitting
+)
+
+
+set.seed(1234)
+system.time({
+  gbm_model <- train(model6,
+                     data = data_train,
+                     method = "gbm",
+                     trControl = train_control,
+                     verbose = FALSE,
+                     tuneGrid = gbm_grid,
+                     na.action = na.omit
+                    )
+})
+
+
+```
+
+```{r , echo=FALSE}
+
+pander(gbm_model$results)
+
+```
+
+As expected, the GBM models slightly over performed the Random Forest models. When those RMSE errors are compared you may visualize a small difference in comparison with the ones found under the RF. Although it takes a lit bit more computer power in order to process those values, the GBM models showed pretty useful and fast to code.
+
+## CONCLUSION
+
+After comparing all the models and methods used, 2 important factors should be highlighted. 
+First, none of the models can be considered good for final predictions. The RMSE errors are really high and this could be caused mostly by the date considered (Christmas Holiday) and the classification imposed under the amenities provided by flat. More data and one more detailed and focused cleaning could definitely improve the final results.
+Finally, the Lasso and the other AI methods presented themselves really close in terms of results. Although the Lasso can possibly provide better interpretable outcomes (coefficients and casuality), it requires much more attention and knowledge about the area and its variables. RF and GBM are more easy to code and implement, and do not require any tough or specific knowledge background. Those trade-offs should be consider when analyzing the data, but in this precise case, the results showed pretty much the same in terms of prediction.
+
